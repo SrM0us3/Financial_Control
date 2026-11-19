@@ -209,6 +209,9 @@ table.data-tbl td.pend{color:var(--danger);font-weight:600}
 .cloud-status.ok{color:var(--success)}
 .cloud-status.err{color:var(--danger)}
 .cloud-status.sync{color:var(--warning)}
+.cloud-row{display:flex;align-items:center;gap:6px;margin-top:2px}
+.btn-cloud-pull{border:1px solid var(--border);background:var(--bg-card);color:var(--text-muted);border-radius:8px;padding:2px 8px;font-size:.65rem;font-weight:600;cursor:pointer;line-height:1.4}
+.btn-cloud-pull:active{background:var(--bg-hover);color:var(--primary)}
 </style>
 <script src="https://www.gstatic.com/firebasejs/10.14.1/firebase-app-compat.js"></script>
 <script src="https://www.gstatic.com/firebasejs/10.14.1/firebase-firestore-compat.js"></script>
@@ -218,7 +221,10 @@ table.data-tbl td.pend{color:var(--danger);font-weight:600}
 <div class="header-top">
 <div>
 <h1>💰 Meu Controle</h1>
+<div class="cloud-row">
 <div class="cloud-status" id="cloudStatus">Nuvem: …</div>
+<button type="button" class="btn-cloud-pull" id="btnCloudPull" title="Puxar dados da nuvem">☁ Puxar</button>
+</div>
 </div>
 <div class="cycle-nav">
 <button id="btnPrevCycle">‹</button>
@@ -495,6 +501,11 @@ const FIREBASE_CONFIG={
 };
 const CLOUD_DOC='financeiro/estado';
 let db=null,firebaseOk=false,applyingRemote=false,saveTimer=null,lastCloudWrite=0,deviceId=null;
+/** Só grava na nuvem depois da 1ª leitura bem-sucedida */
+let cloudReady=false;
+let cloudFirstReadDone=false;
+let unsubCloud=null;
+
 function setCloudStatus(msg,cls){
   const el=document.getElementById('cloudStatus');
   if(!el)return;
@@ -505,6 +516,26 @@ function getDeviceId(){
   if(deviceId)return deviceId;
   try{deviceId=localStorage.getItem('meu_controle_device');if(!deviceId){deviceId='d_'+Date.now().toString(36)+Math.random().toString(36).slice(2,8);localStorage.setItem('meu_controle_device',deviceId)}}catch(e){deviceId='d_tmp'}
   return deviceId;
+}
+/** Quanto “conteúdo” um estado tem (evita sobrescrever nuvem rica com local vazio) */
+function stateRichness(s){
+  if(!s)return 0;
+  const cycles=s.cycles||{};
+  let n=0;
+  n+=(s.transactions||[]).length*10;
+  n+=Object.keys(cycles).length*5;
+  Object.values(cycles).forEach(c=>{
+    (c.fixas||[]).forEach(f=>{
+      if(f.status==='pago'||f.status==='informado')n+=3;
+      if(f.valorPago!=null||f.valorInformado!=null)n+=1;
+    });
+  });
+  n+=(s.consumos||[]).length*2;
+  n+=(s.encerradas||[]).length;
+  return n;
+}
+function isStateEmpty(s){
+  return stateRichness(s)<3;
 }
 function statePayload(){
   return{
@@ -532,10 +563,22 @@ function applyStateData(d){
   state.consumoIdx=d.consumoIdx||0;
 }
 function saveLocal(){
-  try{localStorage.setItem(STORAGE_KEY,JSON.stringify(state))}catch(e){console.warn(e)}
+  try{
+    localStorage.setItem(STORAGE_KEY,JSON.stringify(state));
+    localStorage.setItem(STORAGE_KEY+'_edited',String(Date.now()));
+  }catch(e){console.warn(e)}
 }
-function saveCloud(){
+function getLocalEditedAt(){
+  try{return parseInt(localStorage.getItem(STORAGE_KEY+'_edited')||'0',10)||0}catch(e){return 0}
+}
+function saveCloud(force){
   if(!firebaseOk||!db||applyingRemote)return;
+  if(!cloudReady&&!force)return;
+  // Nunca sobrescrever nuvem se local está vazio (salvo force explícito)
+  if(!force&&isStateEmpty(state)){
+    setCloudStatus('Nuvem: local vazio — não enviei','sync');
+    return;
+  }
   setCloudStatus('Nuvem: salvando…','sync');
   const payload=statePayload();
   lastCloudWrite=payload.updatedAt;
@@ -548,15 +591,28 @@ function saveCloud(){
 }
 function save(){
   saveLocal();
-  if(!firebaseOk)return;
+  if(!firebaseOk||!cloudReady)return;
   clearTimeout(saveTimer);
-  saveTimer=setTimeout(saveCloud,400);
+  saveTimer=setTimeout(()=>saveCloud(false),400);
 }
 function load(){
   try{
     const r=localStorage.getItem(STORAGE_KEY);
     if(r)applyStateData(JSON.parse(r));
   }catch(e){}
+}
+function refreshUIAfterCloud(){
+  if(!currentCycleKey)currentCycleKey=getCycleKeyFromDate(new Date());
+  // ensureCycle sem save na nuvem durante apply
+  const prevReady=cloudReady;
+  cloudReady=false;
+  try{
+    ensureCycle(currentCycleKey);
+  }finally{
+    cloudReady=prevReady;
+  }
+  if(typeof renderAll==='function')renderAll();
+  else if(typeof renderHome==='function')renderHome();
 }
 function initFirebase(){
   if(typeof firebase==='undefined'){
@@ -567,7 +623,7 @@ function initFirebase(){
     if(!firebase.apps.length)firebase.initializeApp(FIREBASE_CONFIG);
     db=firebase.firestore();
     firebaseOk=true;
-    setCloudStatus('Nuvem: conectado','ok');
+    setCloudStatus('Nuvem: lendo…','sync');
     return true;
   }catch(e){
     console.error(e);
@@ -576,35 +632,161 @@ function initFirebase(){
     return false;
   }
 }
-function startCloudSync(){
-  if(!firebaseOk||!db)return;
-  db.doc(CLOUD_DOC).onSnapshot(snap=>{
-    if(!snap.exists){
-      // primeiro uso: sobe o estado local
-      saveCloud();
+function handleCloudSnapshot(snap,isManualPull){
+  const localRich=stateRichness(state);
+  const localEmpty=isStateEmpty(state);
+
+  if(!snap.exists){
+    // Nuvem vazia: só sobe se local tiver dados
+    cloudFirstReadDone=true;
+    cloudReady=true;
+    if(!localEmpty){
+      saveCloud(true);
+      setCloudStatus('Nuvem: enviei dados locais','ok');
+    }else{
+      setCloudStatus('Nuvem: vazia (ok)','ok');
+    }
+    return;
+  }
+
+  const remote=snap.data()||{};
+  const remoteRich=stateRichness(remote);
+  const remoteEmpty=isStateEmpty(remote);
+
+  // Eco da própria gravação
+  if(!isManualPull){
+    if(remote.deviceId===getDeviceId()&&remote.updatedAt&&remote.updatedAt<=lastCloudWrite+80){
+      cloudFirstReadDone=true;
+      cloudReady=true;
       return;
     }
-    const remote=snap.data()||{};
-    // ignora eco da própria gravação
-    if(remote.deviceId===getDeviceId()&&remote.updatedAt&&remote.updatedAt<=lastCloudWrite+50)return;
-    if(remote.updatedAt&&remote.updatedAt<=lastCloudWrite)return;
+    if(cloudFirstReadDone&&remote.updatedAt&&remote.updatedAt<=lastCloudWrite){
+      return;
+    }
+  }
+
+  // Primeira leitura (ou pull manual): decidir quem ganha
+  if(!cloudFirstReadDone||isManualPull){
+    cloudFirstReadDone=true;
+
+    // Local vazio → sempre preferir nuvem
+    if(localEmpty&&!remoteEmpty){
+      applyingRemote=true;
+      try{
+        applyStateData(remote);
+        saveLocal();
+        lastCloudWrite=remote.updatedAt||Date.now();
+        setCloudStatus('Nuvem: dados carregados','ok');
+        refreshUIAfterCloud();
+      }finally{applyingRemote=false;cloudReady=true;}
+      return;
+    }
+
+    // Nuvem rica e local bem mais pobre → preferir nuvem (não apagar)
+    if(!remoteEmpty&&remoteRich>localRich*2&&localRich<20){
+      applyingRemote=true;
+      try{
+        applyStateData(remote);
+        saveLocal();
+        lastCloudWrite=remote.updatedAt||Date.now();
+        setCloudStatus('Nuvem: restaurei dados da nuvem','ok');
+        refreshUIAfterCloud();
+      }finally{applyingRemote=false;cloudReady=true;}
+      return;
+    }
+
+    // Local rico e nuvem vazia/pobre → sobe local
+    if(!localEmpty&&(remoteEmpty||localRich>remoteRich*2)){
+      cloudReady=true;
+      lastCloudWrite=Date.now();
+      saveCloud(true);
+      setCloudStatus('Nuvem: enviei dados locais','ok');
+      return;
+    }
+
+    // Ambos com dados: o mais recente ganha (updatedAt)
+    const localEdited=getLocalEditedAt();
+    const remoteAt=remote.updatedAt||0;
+    if(isManualPull||remoteAt>localEdited){
+      applyingRemote=true;
+      try{
+        applyStateData(remote);
+        saveLocal();
+        lastCloudWrite=remoteAt||Date.now();
+        setCloudStatus(isManualPull?'Nuvem: puxado':'Nuvem: atualizado','ok');
+        refreshUIAfterCloud();
+      }finally{applyingRemote=false;cloudReady=true;}
+      return;
+    }
+
+    // Local mais recente → sobe
+    cloudReady=true;
+    lastCloudWrite=Math.max(lastCloudWrite,remoteAt,localEdited);
+    setCloudStatus('Nuvem: sincronizado','ok');
+    if(!localEmpty)saveCloud(false);
+    return;
+  }
+
+  // Depois da 1ª leitura: atualizações remotas de outros dispositivos
+  if(remote.updatedAt&&remote.updatedAt>lastCloudWrite){
+    // Não aplicar remoto vazio por cima de local rico
+    if(remoteEmpty&&!localEmpty){
+      setCloudStatus('Nuvem: ignorei remoto vazio','sync');
+      return;
+    }
     applyingRemote=true;
     try{
       applyStateData(remote);
       saveLocal();
       lastCloudWrite=remote.updatedAt||Date.now();
       setCloudStatus('Nuvem: atualizado','ok');
-      if(typeof renderAll==='function'){
-        if(!currentCycleKey)currentCycleKey=getCycleKeyFromDate(new Date());
-        ensureCycle(currentCycleKey);
-        renderAll();
-      }
-    }finally{
-      applyingRemote=false;
-    }
-  },err=>{
+      refreshUIAfterCloud();
+    }finally{applyingRemote=false;}
+  }
+}
+function startCloudSync(){
+  if(!firebaseOk||!db)return;
+  if(unsubCloud){try{unsubCloud()}catch(e){}}
+  setCloudStatus('Nuvem: lendo…','sync');
+  // 1ª leitura explícita (get) antes de aceitar writes
+  db.doc(CLOUD_DOC).get().then(snap=>{
+    handleCloudSnapshot(snap,false);
+    // listener contínuo
+    unsubCloud=db.doc(CLOUD_DOC).onSnapshot(s=>{
+      handleCloudSnapshot(s,false);
+    },err=>{
+      console.error(err);
+      setCloudStatus('Nuvem: erro no listener','err');
+      // libera gravação local mesmo com erro de listener, mas não força upload vazio
+      cloudFirstReadDone=true;
+      cloudReady=true;
+    });
+  }).catch(err=>{
     console.error(err);
-    setCloudStatus('Nuvem: erro no listener','err');
+    setCloudStatus('Nuvem: erro ao ler','err');
+    cloudFirstReadDone=true;
+    cloudReady=true; // permite uso offline; saveCloud ainda bloqueia se local vazio
+  });
+}
+/** Puxar da nuvem sob demanda (botão) */
+function pullFromCloud(){
+  if(!firebaseOk||!db){
+    toast('Nuvem indisponível');
+    return;
+  }
+  setCloudStatus('Nuvem: puxando…','sync');
+  db.doc(CLOUD_DOC).get().then(snap=>{
+    if(!snap.exists){
+      toast('Nuvem sem dados');
+      setCloudStatus('Nuvem: vazia','ok');
+      return;
+    }
+    handleCloudSnapshot(snap,true);
+    toast('Dados puxados da nuvem');
+  }).catch(err=>{
+    console.error(err);
+    toast('Erro ao puxar da nuvem');
+    setCloudStatus('Nuvem: erro ao puxar','err');
   });
 }
 function getCycleKeyFromDate(date){const d=new Date(date);let y=d.getFullYear(),m=d.getMonth();if(d.getDate()<20){m-=1;if(m<0){m=11;y-=1}}return y+'-'+String(m+1).padStart(2,'0')}
@@ -1517,7 +1699,11 @@ if(f.id==='parc1'){f.nome='Parcelamento I100507'}
 })});
 
 saveLocal();
-currentCycleKey=getCycleKeyFromDate(new Date());ensureCycle(currentCycleKey);renderHome();
+currentCycleKey=getCycleKeyFromDate(new Date());
+// cria ciclo local sem tentar subir à nuvem (cloudReady ainda false)
+ensureCycle(currentCycleKey);
+renderHome();
+document.getElementById('btnCloudPull').onclick=()=>pullFromCloud();
 if(initFirebase())startCloudSync();
 else setCloudStatus('Nuvem: offline (só local)','err');
 </script>
