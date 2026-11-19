@@ -341,6 +341,7 @@ table.data-tbl td.pend{color:var(--danger);font-weight:600}
 <div class="section-title">Anotações</div>
 <div class="notas-toolbar">
 <span class="hint">Texto ou número. Fórmula: <code>=A1+B2-10</code></span>
+<button type="button" id="btnNotasToggleSign" title="Inverter sinal da célula">+/−</button>
 <button type="button" id="btnNotasAddRow">＋ Linha</button>
 <button type="button" id="btnNotasAddCol">＋ Coluna</button>
 </div>
@@ -1643,14 +1644,21 @@ function parseNumCell(raw){
   const n=parseFloat(t);
   return isNaN(n)?null:n;
 }
-/** Avalia =A1+B2-10 (só + e − e referências) */
+/** Avalia =A1+B2-10 ou =-(A1+B2) (só + e −, refs e parênteses) */
 function evalNotasFormula(expr,getVal,depth){
-  if(depth>20)return NaN;
+  if(depth>25)return NaN;
   let e=String(expr||'').trim();
   if(e.startsWith('='))e=e.slice(1);
   e=e.replace(/\s/g,'').replace(/,/g,'.');
   if(!e)return NaN;
-  // tokeniza números, refs e +/- 
+  // resolve parênteses de dentro para fora
+  while(e.indexOf('(')>=0){
+    const m=e.match(/\(([^()]*)\)/);
+    if(!m)return NaN;
+    const inner=evalNotasFormula('='+m[1],getVal,depth+1);
+    if(isNaN(inner))return NaN;
+    e=e.replace(m[0],String(inner));
+  }
   const tokens=[];
   let i=0;
   while(i<e.length){
@@ -1669,7 +1677,6 @@ function evalNotasFormula(expr,getVal,depth){
     return NaN;
   }
   if(!tokens.length)return NaN;
-  // se começa com número/ref, assume +
   let sign=1,acc=0,expectOperand=true;
   for(const tok of tokens){
     if(tok==='+'||tok==='-'){
@@ -1679,11 +1686,8 @@ function evalNotasFormula(expr,getVal,depth){
     }
     if(!expectOperand)return NaN;
     let v;
-    if(/^[A-Z]+\d+$/.test(tok)){
-      v=getVal(tok,depth+1);
-    }else{
-      v=parseFloat(tok);
-    }
+    if(/^[A-Z]+\d+$/.test(tok))v=getVal(tok,depth+1);
+    else v=parseFloat(tok);
     if(v==null||isNaN(v))return NaN;
     acc+=sign*v;
     expectOperand=false;
@@ -1740,14 +1744,18 @@ function renderNotas(){
       const isF=String(raw).trim().startsWith('=');
       const num=parseNumCell(raw);
       let cls='cell';
-      if(isF)cls+=' formula';
-      else if(num!=null)cls+=' num';
-      const valAttr=esc(raw);
-      body+=`<td><input class="${cls}" data-r="${r}" data-c="${c}" value="${valAttr}" spellcheck="false"/></td>`;
+      let show=raw;
+      if(isF){
+        const d=notasDisplayValue(r,c,raw,cache,0);
+        cls+=' '+d.cls;
+        show=d.text; // mostra resultado; fórmula fica em data-raw
+      }else if(num!=null){
+        cls+=' num';
+      }
+      body+=`<td><input class="${cls}" data-r="${r}" data-c="${c}" data-raw="${esc(raw)}" value="${esc(show)}" spellcheck="false"/></td>`;
     }
     body+='</tr>';
   }
-  // totais por coluna (só números diretos + resultado de fórmula)
   let foot='<tr><td class="row-h">Σ</td>';
   for(let c=0;c<n.cols;c++){
     let sum=0,any=false;
@@ -1767,13 +1775,25 @@ function renderNotas(){
   foot+='</tr>';
   wrap.innerHTML=`<table class="notas-tbl"><thead>${head}</thead><tbody>${body}</tbody><tfoot>${foot}</tfoot></table>`;
   wrap.querySelectorAll('input.cell').forEach(inp=>{
-    inp.addEventListener('change',()=>{
+    inp.addEventListener('focus',()=>{
       const r=+inp.dataset.r,c=+inp.dataset.c;
-      const v=inp.value;
+      notasSelected={r,c};
+      // ao editar, mostra a fórmula/texto original
+      const raw=inp.dataset.raw!=null?inp.dataset.raw:(ensureNotas().cells[notasCellKey(r,c)]||'');
+      if(String(raw).trim().startsWith('=')){
+        inp.value=raw;
+      }
+    });
+    inp.addEventListener('blur',()=>{
+      const r=+inp.dataset.r,c=+inp.dataset.c;
       const key=notasCellKey(r,c);
+      const v=inp.value;
       if(!v.trim())delete ensureNotas().cells[key];
       else ensureNotas().cells[key]=v;
       save();
+      // re-render para mostrar resultado das fórmulas
+      const was={r,c};
+      notasSelected=was;
       renderNotas();
     });
     inp.addEventListener('keydown',e=>{
@@ -1781,6 +1801,55 @@ function renderNotas(){
     });
   });
 }
+let notasSelected=null;
+function toggleNotasSign(){
+  // prioriza input com foco; senão a última selecionada
+  let inp=document.querySelector('#notasWrap input.cell:focus');
+  if(!inp&&notasSelected){
+    inp=document.querySelector(`#notasWrap input.cell[data-r="${notasSelected.r}"][data-c="${notasSelected.c}"]`);
+  }
+  if(!inp){
+    toast('Selecione uma célula primeiro');
+    return;
+  }
+  const r=+inp.dataset.r,c=+inp.dataset.c;
+  notasSelected={r,c};
+  // preferir valor salvo / data-raw (fórmula), não o resultado exibido
+  let raw=String((ensureNotas().cells[notasCellKey(r,c)])||inp.dataset.raw||inp.value||'').trim();
+  if(!raw){
+    toast('Célula vazia');
+    return;
+  }
+  let next=null;
+  if(raw.startsWith('=')){
+    // fórmula: =expr  →  =-(expr)  ou desfaz se já for =-(...)
+    let body=raw.slice(1).trim();
+    if(/^-\(.+\)$/.test(body)){
+      next='='+body.slice(2,-1);
+    }else{
+      next='=-('+body+')';
+    }
+  }else{
+    const n=parseNumCell(raw);
+    if(n==null){
+      toast('Só números ou fórmulas');
+      return;
+    }
+    const flipped=-n;
+    // preserva vírgula se o usuário usava
+    if(raw.indexOf(',')>=0){
+      next=String(flipped).replace('.',',');
+    }else{
+      next=String(flipped);
+    }
+  }
+  ensureNotas().cells[notasCellKey(r,c)]=next;
+  save();
+  renderNotas();
+  const after=document.querySelector(`#notasWrap input.cell[data-r="${r}"][data-c="${c}"]`);
+  if(after)after.focus();
+}
+document.getElementById('btnNotasToggleSign').onclick=()=>toggleNotasSign();
 document.getElementById('btnNotasAddRow').onclick=()=>{ensureNotas().rows=Math.min(50,(ensureNotas().rows||12)+1);save();renderNotas()};
 document.getElementById('btnNotasAddCol').onclick=()=>{ensureNotas().cols=Math.min(12,(ensureNotas().cols||4)+1);save();renderNotas()};
 
