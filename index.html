@@ -1854,8 +1854,48 @@ document.getElementById('btnNotasAddRow').onclick=()=>{ensureNotas().rows=Math.m
 document.getElementById('btnNotasAddCol').onclick=()=>{ensureNotas().cols=Math.min(12,(ensureNotas().cols||4)+1);save();renderNotas()};
 
 function renderConfig(){setHeaderMode('other');renderHeader(null);document.getElementById('cfgSalario').value=state.config.salario;document.getElementById('cfgPrincipais').value=state.config.envelopes.principais;document.getElementById('cfgFernanda').value=state.config.envelopes.fernanda;document.getElementById('cfgSecundarias').value=state.config.envelopes.secundarias;document.getElementById('cfgFixasValues').innerHTML=state.fixasTemplate.filter(f=>f.valorFixo!=null).map(f=>`<div class="config-item"><div class="left"><div class="t">${esc(f.nome)}</div><div class="s">${f.envelope}</div></div><input type="number" data-id="${f.id}" step="0.01" value="${f.valorFixo}"/></div>`).join('')}
-document.getElementById('btnSaveCfg').onclick=()=>{state.config.salario=parseFloat(document.getElementById('cfgSalario').value)||0;state.config.envelopes.principais=parseFloat(document.getElementById('cfgPrincipais').value)||0;state.config.envelopes.fernanda=parseFloat(document.getElementById('cfgFernanda').value)||0;state.config.envelopes.secundarias=parseFloat(document.getElementById('cfgSecundarias').value)||0;save();toast('Salvo (só ciclos futuros)')};
-document.getElementById('btnSaveFixas').onclick=()=>{document.querySelectorAll('#cfgFixasValues input').forEach(inp=>{const f=state.fixasTemplate.find(x=>x.id===inp.dataset.id);if(f)f.valorFixo=parseFloat(inp.value)||0});save();toast('Valores atualizados')};
+document.getElementById('btnSaveCfg').onclick=()=>{
+state.config.salario=parseFloat(document.getElementById('cfgSalario').value)||0;
+state.config.envelopes.principais=parseFloat(document.getElementById('cfgPrincipais').value)||0;
+state.config.envelopes.fernanda=parseFloat(document.getElementById('cfgFernanda').value)||0;
+state.config.envelopes.secundarias=parseFloat(document.getElementById('cfgSecundarias').value)||0;
+// envelopes/salário: ciclo atual só se ainda não houver gastos quitados demais? regra antiga: só futuros
+// aplica em ciclos sem lançamentos pagos (esqueleto) e no atual se for o caso — mantém só futuros criados via ensureCycle
+save();
+toast('Salvo (novos ciclos usarão esses valores)');
+};
+/** Propaga valorFixo do template para ciclos onde a conta ainda NÃO está paga */
+function propagateFixaValor(id,novoValor){
+  let n=0;
+  Object.keys(state.cycles||{}).forEach(key=>{
+    const c=state.cycles[key];
+    if(!c||!c.fixas)return;
+    c.fixas.forEach(f=>{
+      if(f.id!==id)return;
+      if(f.status==='pago'||f.status==='encerrada')return; // já pago: não mexe
+      f.valorFixo=novoValor;
+      // se estava só pendente, ok; se informado, atualiza também o valor informado
+      // para o total pendente refletir o novo valor padrão
+      if(f.status==='informado')f.valorInformado=novoValor;
+      n++;
+    });
+  });
+  return n;
+}
+document.getElementById('btnSaveFixas').onclick=()=>{
+  let changed=0,propagated=0;
+  document.querySelectorAll('#cfgFixasValues input').forEach(inp=>{
+    const f=state.fixasTemplate.find(x=>x.id===inp.dataset.id);
+    if(!f)return;
+    const novo=parseFloat(inp.value);
+    const val=isNaN(novo)?0:novo;
+    if(f.valorFixo!==val)changed++;
+    f.valorFixo=val;
+    propagated+=propagateFixaValor(f.id,val);
+  });
+  save();
+  toast(propagated?('Valores atualizados ('+propagated+' conta(s) em ciclos abertos)'):'Valores do modelo atualizados');
+};
 document.getElementById('btnBackup').onclick=()=>{const a=document.createElement('a');a.href=URL.createObjectURL(new Blob([JSON.stringify(state,null,2)],{type:'application/json'}));a.download='backup-controle-'+todayISO()+'.json';a.click();toast('Backup baixado')};
 document.getElementById('inputRestore').onchange=e=>{const file=e.target.files[0];if(!file)return;const r=new FileReader();r.onload=ev=>{try{const d=JSON.parse(ev.target.result);if(confirm('Substituir todos os dados?')){state=d;if(!state.encerradas)state.encerradas=[];save();currentCycleKey=getCycleKeyFromDate(new Date());renderAll();toast('Restaurado!')}}catch{toast('Arquivo inválido')}};r.readAsText(file);e.target.value=''};
 document.getElementById('btnReset').onclick=()=>{if(confirm('Apagar TODOS os dados?')){state={config:JSON.parse(JSON.stringify(DEFAULT_CONFIG)),fixasTemplate:JSON.parse(JSON.stringify(DEFAULT_FIXAS)),cycles:{},transactions:[],encerradas:[]};save();currentCycleKey=getCycleKeyFromDate(new Date());renderAll();toast('Resetado')}};
